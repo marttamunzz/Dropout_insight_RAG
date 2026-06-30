@@ -6,13 +6,403 @@ import pandas as pd
 import plotly.express as px
 
 import time
+import re
 from dash import dcc, html, Input, Output, State, dash_table
 from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 from explainerdashboard.custom import *
 
+from rag.rag_recommender import generate_rag_recommendations
+from rag.llm_providers import LLM_MODELS
+
 from dice_ml.model_interfaces.base_model import BaseModel
 import plotly.graph_objects as go
+
+
+def build_counterfactuals_text(original_row, cf_df):
+    if cf_df is None or cf_df.empty:
+        return ""
+
+    lines = []
+    for i, cf_row in cf_df.iterrows():
+        changed = []
+        for col in cf_row.index:
+            if col in original_row.index and str(cf_row[col]) != str(original_row[col]):
+                changed.append(f"{col}: {original_row[col]} -> {cf_row[col]}")
+        if changed:
+            lines.append(f"CF {i+1}: " + "; ".join(changed))
+        else:
+            lines.append(f"CF {i+1}: No changes detected.")
+
+    return "\n".join(lines)
+
+
+def build_student_summary(original_row, target_col):
+    values = [f"{col}={original_row[col]}" for col in original_row.index if col != target_col]
+    return f"Student profile: {'; '.join(values)}."
+
+
+def clean_rag_section_title(title):
+    """
+    Clean Markdown markers from accordion titles while keeping the text readable.
+    Examples:
+    - "## 1. Interpretation" -> "1. Interpretation"
+    - "**1. Risk factors:**" -> "1. Risk factors"
+    """
+    title = (title or "").strip()
+
+    # Remove wrapping Markdown emphasis.
+    title = re.sub(r"^\*+\s*", "", title)
+    title = re.sub(r"\s*\*+$", "", title)
+
+    # Remove extra heading markers, bullets and repeated spaces.
+    title = re.sub(r"^#{1,6}\s*", "", title)
+    title = re.sub(r"^\s*[-•]\s*", "", title)
+    title = re.sub(r"\s+", " ", title).strip()
+
+    # If the title ends with a Markdown bold marker or colon, make it cleaner.
+    title = title.strip("*").strip()
+    title = title[:-1].strip() if title.endswith(":") else title
+
+    return title or "Recommendation section"
+
+
+def is_rag_section_heading(line):
+    """
+    Detect section headings in RAG answers.
+
+    It supports:
+    - Markdown headings: ## 1. Interpretation
+    - Numbered headings: 1. Interpretation
+    - Bold numbered headings: **1. Interpretation**
+    - Parenthesized headings: 1) Interpretation
+
+    It intentionally ignores indented lines so normal nested lists are less likely
+    to become accordion sections.
+    """
+    if not line or not line.strip():
+        return None
+
+    raw = line.rstrip()
+    stripped = raw.strip()
+
+    # Avoid converting indented nested lists into main accordion sections.
+    if raw.startswith((" ", "\t")):
+        return None
+
+    # Markdown headings.
+    heading_match = re.match(r"^#{1,6}\s+(.+?)\s*$", stripped)
+    if heading_match:
+        return clean_rag_section_title(heading_match.group(1))
+
+    # Remove wrapping bold/italic before testing numbered headings.
+    simplified = stripped.strip()
+    simplified = re.sub(r"^\*+\s*", "", simplified)
+    simplified = re.sub(r"\s*\*+$", "", simplified)
+
+    # Numbered top-level headings, e.g. "1. Interpretation" or "2) Risk factors".
+    numbered_match = re.match(r"^(\d{1,2})[\.\)]\s+(.+?)\s*$", simplified)
+    if numbered_match:
+        candidate = f"{numbered_match.group(1)}. {numbered_match.group(2)}"
+        return clean_rag_section_title(candidate)
+
+    return None
+
+
+def split_rag_markdown_sections(markdown_text):
+    """
+    Split an LLM/RAG Markdown answer into visual accordion sections.
+
+    The LLM sometimes returns headings as Markdown:
+        ## 1. Interpretation
+
+    But it can also return plain numbered sections:
+        1. Interpretation of the group
+        2. Main risk factors
+
+    This function detects both formats and turns them into collapsed accordion items.
+    If no section heading is detected, the whole answer is shown in one collapsed item.
+    """
+    text = (markdown_text or "").strip()
+
+    if not text:
+        return [("Recommendation", "No recommendation generated.")]
+
+    lines = text.splitlines()
+    sections = []
+    current_title = None
+    current_lines = []
+
+    def flush_section():
+        nonlocal current_title, current_lines
+
+        body = "\n".join(current_lines).strip()
+        if current_title is not None:
+            sections.append((current_title, body or "No additional details."))
+        elif body:
+            sections.append(("Overview", body))
+
+        current_title = None
+        current_lines = []
+
+    for line in lines:
+        section_title = is_rag_section_heading(line)
+
+        if section_title:
+            flush_section()
+            current_title = section_title
+        else:
+            current_lines.append(line)
+
+    flush_section()
+
+    if not sections:
+        sections = [("Recommendation", text)]
+
+    return sections
+
+
+def build_rag_card(recommendation_text, model_key=None, title="Individual RAG recommendation"):
+    """
+    Build a nicer RAG recommendation card.
+    Each Markdown heading returned by the LLM is shown as a collapsible accordion item.
+    """
+    model_label = LLM_MODELS.get(model_key, {}).get("label", model_key or "LLM")
+    sections = split_rag_markdown_sections(recommendation_text)
+
+    accordion_items = []
+
+    for i, (section_title, section_body) in enumerate(sections):
+        # Use a Dash component as the accordion title so the section heading
+        # keeps a strong visual weight even after Markdown markers are cleaned.
+        accordion_title = html.Div(
+            [
+                html.Span(
+                    section_title,
+                    style={
+                        "fontWeight": "850",
+                        "color": "#0f172a",
+                        "fontSize": "1rem",
+                    },
+                ),
+                html.Span(
+                    "Click to expand",
+                    style={
+                        "fontSize": "0.76rem",
+                        "fontWeight": "700",
+                        "color": "#64748b",
+                        "background": "#f1f5f9",
+                        "padding": "4px 9px",
+                        "borderRadius": "999px",
+                        "marginLeft": "10px",
+                        "whiteSpace": "nowrap",
+                    },
+                ),
+            ],
+            style={
+                "display": "flex",
+                "alignItems": "center",
+                "justifyContent": "space-between",
+                "gap": "12px",
+                "width": "100%",
+            },
+        )
+
+        accordion_items.append(
+            dbc.AccordionItem(
+                dcc.Markdown(
+                    section_body,
+                    className="rag-markdown",
+                    link_target="_blank",
+                    style={
+                        "fontSize": "0.98rem",
+                        "lineHeight": "1.7",
+                        "color": "#1f2937",
+                        "margin": "0",
+                    },
+                ),
+                title=accordion_title,
+                item_id=f"rag-section-{i}",
+                style={
+                    "border": "1px solid rgba(15, 23, 42, 0.08)",
+                    "borderRadius": "12px",
+                    "overflow": "hidden",
+                    "marginBottom": "10px",
+                },
+            )
+        )
+
+    active_items = []  # Start with every section collapsed so the card does not take too much space.
+
+    return dbc.Card(
+        [
+            dbc.CardHeader(
+                html.Div(
+                    [
+                        html.Div(
+                            [
+                                html.Div(
+                                    "AI generated prescriptive recommendation",
+                                    style={
+                                        "fontSize": "0.76rem",
+                                        "fontWeight": "800",
+                                        "letterSpacing": "0.08em",
+                                        "textTransform": "uppercase",
+                                        "color": "#4f46e5",
+                                        "marginBottom": "4px",
+                                    },
+                                ),
+                                html.H4(
+                                    title,
+                                    style={
+                                        "margin": "0",
+                                        "fontSize": "1.25rem",
+                                        "fontWeight": "800",
+                                        "color": "#0f172a",
+                                    },
+                                ),
+                                html.Div(
+                                    "Evidence retrieved from the RAG system and adapted to the generated counterfactuals.",
+                                    style={
+                                        "fontSize": "0.9rem",
+                                        "color": "#64748b",
+                                        "marginTop": "4px",
+                                    },
+                                ),
+                            ]
+                        ),
+                        html.Span(
+                            model_label,
+                            style={
+                                "display": "inline-flex",
+                                "alignItems": "center",
+                                "padding": "7px 12px",
+                                "borderRadius": "999px",
+                                "background": "#0f172a",
+                                "color": "#ffffff",
+                                "fontSize": "0.82rem",
+                                "fontWeight": "700",
+                                "whiteSpace": "nowrap",
+                            },
+                        ),
+                    ],
+                    style={
+                        "display": "flex",
+                        "alignItems": "center",
+                        "justifyContent": "space-between",
+                        "gap": "16px",
+                    },
+                ),
+                style={
+                    "background": "linear-gradient(135deg, #eef5ff 0%, #f8fbff 45%, #f6f3ff 100%)",
+                    "borderBottom": "1px solid rgba(15, 23, 42, 0.08)",
+                    "padding": "18px 22px",
+                },
+            ),
+            dbc.CardBody(
+                [
+                    dbc.Accordion(
+                        accordion_items,
+                        active_item=active_items,
+                        always_open=True,
+                    )
+                ],
+                style={
+                    "backgroundColor": "#ffffff",
+                    "padding": "18px",
+                },
+            ),
+        ],
+        style={
+            "border": "1px solid rgba(15, 23, 42, 0.08)",
+            "borderRadius": "18px",
+            "overflow": "hidden",
+            "background": "#ffffff",
+            "boxShadow": "0 12px 32px rgba(15, 23, 42, 0.08)",
+        },
+        class_name="mt-3",
+    )
+
+
+def build_rag_error_card(error_message, title="Individual RAG recommendation"):
+    return dbc.Card(
+        [
+            dbc.CardHeader(
+                html.Div(
+                    [
+                        html.Div(
+                            [
+                                html.Div(
+                                    "AI generated prescriptive recommendation",
+                                    style={
+                                        "fontSize": "0.76rem",
+                                        "fontWeight": "800",
+                                        "letterSpacing": "0.08em",
+                                        "textTransform": "uppercase",
+                                        "color": "#dc2626",
+                                        "marginBottom": "4px",
+                                    },
+                                ),
+                                html.H4(
+                                    title,
+                                    style={
+                                        "margin": "0",
+                                        "fontSize": "1.25rem",
+                                        "fontWeight": "800",
+                                        "color": "#0f172a",
+                                    },
+                                ),
+                            ]
+                        ),
+                        html.Span(
+                            "Error",
+                            style={
+                                "display": "inline-flex",
+                                "alignItems": "center",
+                                "padding": "7px 12px",
+                                "borderRadius": "999px",
+                                "background": "#dc2626",
+                                "color": "#ffffff",
+                                "fontSize": "0.82rem",
+                                "fontWeight": "700",
+                                "whiteSpace": "nowrap",
+                            },
+                        ),
+                    ],
+                    style={
+                        "display": "flex",
+                        "alignItems": "center",
+                        "justifyContent": "space-between",
+                        "gap": "16px",
+                    },
+                ),
+                style={
+                    "background": "#fff1f2",
+                    "borderBottom": "1px solid rgba(220, 38, 38, 0.18)",
+                    "padding": "18px 22px",
+                },
+            ),
+            dbc.CardBody(
+                dbc.Alert(
+                    [
+                        html.Strong("The recommendation could not be generated. "),
+                        html.Span(str(error_message)),
+                    ],
+                    color="danger",
+                    className="mb-0",
+                ),
+                style={"backgroundColor": "#ffffff"},
+            ),
+        ],
+        style={
+            "border": "1px solid rgba(220, 38, 38, 0.18)",
+            "borderRadius": "18px",
+            "overflow": "hidden",
+            "background": "#ffffff",
+            "boxShadow": "0 12px 32px rgba(15, 23, 42, 0.08)",
+        },
+        class_name="mt-3",
+    )
 
 
 class AutoMLReportComponent(ExplainerComponent):
@@ -338,6 +728,32 @@ class CounterfactualsComponent(ExplainerComponent):
                         html.Div(id='cf-graphs')
                     ]),
                 ]),
+
+                html.Hr(),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label("LLM for RAG recommendation"),
+                        dcc.Dropdown(
+                            id='rag-llm-dropdown-'+self.name,
+                            options=[{'label': cfg['label'], 'value': key} for key, cfg in LLM_MODELS.items()],
+                            value=list(LLM_MODELS.keys())[0],
+                            clearable=False
+                        ),
+                    ], width=6, md=6)
+                ], class_name="mb-3"),
+
+                dbc.Row([
+                    dbc.Col([
+                        dcc.Loading(
+                            id='rag-loading-'+self.name,
+                            children=html.Div(
+                                id='rag-output-'+self.name,
+                                style={'display': 'none'}
+                            ),
+                            type='default'
+                        )
+                    ])
+                ]),
             ]),
         ], class_name="h-100")
 
@@ -350,79 +766,193 @@ class CounterfactualsComponent(ExplainerComponent):
             Output('counterfactuals-title', 'hidden'),
             Output('original-title', 'hidden'),
             Output('cf-graphs', 'children'),
+            Output('rag-output-'+self.name, 'children'),
+            Output('rag-output-'+self.name, 'style'),
             [State('random-index-clas-index-'+self.name, 'value'),
-             State('input', 'value')],
+             State('input', 'value'),
+             State('rag-llm-dropdown-'+self.name, 'value')],
             [Input('button', 'n_clicks')]
         )
-        def generate_counterfactuals(dataIndex, input, n_clicks):
+        def generate_counterfactuals(dataIndex, input, rag_model_key, n_clicks):
             """
             Generate counterfactual scenarios given a row index and a desired number of counterfactuals.
-
-            Args:
-                - dataIndex (int): Index of the row in the dataframe to generate counterfactuals for.
-                - input (int): Desired number of counterfactuals to generate.
-                - n_clicks (int): Count of click events.
-
-            Returns:
-                - tuple: A tuple containing the following items: 
-                    - counterfactuals_data containing the data of the counterfactuals generated.
-                    - counterfactuals_columns containing the columns of the counterfactuals generated 
-                    - original_data containing the data of the original dataframe. 
-                    - original_columns containing the columns of the original dataframe.
-                    - False that changes the visibility of both titles (Original and Counterfactuals) from hidden to visible.
+            This version prepares DiCE inputs using one single, normalized dataframe so the query instance
+            cannot fall outside the ranges/categories known by DiCE.
             """
 
             print("📥 Activated Callback:")
             print("📌 Received DataIndex:", dataIndex)
-
             print("✅ Clicked button:", n_clicks)
+
+            empty_response = ([], [], [], [], True, True, [], "", {'display': 'none'})
+
             if n_clicks is None or dataIndex is None or input is None:
                 print("⚠️ Missing input data")
-                return [], [], [], [], True, True, []
+                return empty_response
+
+            try:
+                total_cfs = int(input)
+            except Exception:
+                return [], [], [], [], True, True, [
+                    dbc.Alert("Please enter a valid number of counterfactual scenarios.", color="warning")
+                ], "", {'display': 'none'}
+
+            total_cfs = max(1, min(total_cfs, 10))
 
             print("📌 DataIndex type :", type(dataIndex))
-            print("📊 First 5 índices of the dataframe:",
-                  self.dataframe.index[:5])
-            print("✅ ¿Is index in the dataframe?",
-                  dataIndex in self.dataframe.index)
+            print("📊 First 5 índices of the dataframe:", self.dataframe.index[:5])
 
-            # Check if any argument is None and return None if so
-            if (dataIndex is None or input is None or n_clicks is None):
-                return None
-
-            # Get the dataframe of student data and select the row at the specified index
+            # -----------------------------
+            # 1) Build one clean dataframe for DiCE
+            # -----------------------------
             df = self.dataframe.copy()
-            df.index = df.index.map(str)           # normaliza el índice a str una vez
-            key = str(dataIndex)                   # normaliza también la clave seleccionada
+            df.index = df.index.map(str)
+            key = str(dataIndex)
+
+            print("✅ ¿Is index in the dataframe?", key in df.index)
 
             if key not in df.index:
-                return html.Div(f"⚠️ Student id '{key}' not found in current data.")  # evita el 500 y muestra aviso
+                return [], [], [], [], True, True, [
+                    dbc.Alert(f"Student id '{key}' not found in current data.", color="warning")
+                ], "", {'display': 'none'}
 
-            student_data = df.loc[[key]]
+            target_col = df.columns[-1]
+            feature_cols = [c for c in df.columns if c != target_col]
 
-            student_data_deleted_target_column = student_data.drop(
-                columns=self.dataframe.columns[-1])
+            # Make sure target is numeric for DiCE/classification.
+            df[target_col] = df[target_col].replace({
+                "Dropout": 0,
+                "No dropout": 1,
+                "dropout": 0,
+                "no dropout": 1
+            })
 
-            # Select continuous features from the dataframe (those that are float)
-            continuous_features = student_data_deleted_target_column.select_dtypes(
-                include=['float64']).columns.tolist()
+            # Drop rows with missing target.
+            df = df.dropna(subset=[target_col]).copy()
 
-            # Categorical features
-            categorical_features = [
-                col for col in self.dataframe.columns
-                if col not in continuous_features and col != self.dataframe.columns[-1]
+            # Normalize target to int when possible.
+            try:
+                df[target_col] = df[target_col].astype(int)
+            except Exception:
+                pass
+
+            # Query instance and original row.
+            student_data = df.loc[[key]].copy()
+            query_instance = student_data[feature_cols].copy()
+
+            # -----------------------------
+            # 2) Align dtypes between dataframe and query
+            # -----------------------------
+            # DiCE validates the query against the dataframe ranges/categories.
+            # We keep the same dtypes and append the query row back to the DiCE dataframe
+            # so categorical and numeric checks always include the selected student.
+            dice_dataframe = df.copy()
+
+            for col in feature_cols:
+                # If the column is numeric in the dataframe, make query numeric too.
+                if pd.api.types.is_numeric_dtype(dice_dataframe[col]):
+                    dice_dataframe[col] = pd.to_numeric(dice_dataframe[col], errors="coerce")
+                    query_instance[col] = pd.to_numeric(query_instance[col], errors="coerce")
+                else:
+                    # Keep categorical values comparable.
+                    dice_dataframe[col] = dice_dataframe[col].astype(str)
+                    query_instance[col] = query_instance[col].astype(str)
+
+            # Remove rows that cannot be used by DiCE, but never lose the selected query row.
+            dice_dataframe = dice_dataframe.dropna(subset=feature_cols + [target_col]).copy()
+
+            query_with_target = query_instance.copy()
+            query_with_target[target_col] = student_data[target_col].iloc[0]
+
+            # Append the query explicitly. This avoids:
+            # ValueError: ('Feature', feature, 'has a value outside the dataset.')
+            dice_dataframe = pd.concat([dice_dataframe, query_with_target], ignore_index=True)
+
+            # -----------------------------
+            # 3) Select feature types and actionable features
+            # -----------------------------
+            continuous_features = [
+                col for col in feature_cols
+                if pd.api.types.is_float_dtype(dice_dataframe[col])
             ]
 
-            # Create a data object using the dataframe, continuous features and specify the outcome name
-            data = dml.Data(dataframe=self.dataframe, continuous_features=continuous_features,
-                            categorical_features=categorical_features, outcome_name=self.dataframe.columns[-1])
+            categorical_features = [
+                col for col in feature_cols
+                if col not in continuous_features
+            ]
+
+            # Avoid non-prescriptive or immutable variables in counterfactual recommendations.
+            non_actionable_keywords = [
+                "marital", "nationality", "gender", "age at enrollment",
+                "application mode", "application order", "course",
+                "daytime/evening", "previous qualification",
+                "mother", "father", "educational special needs",
+                "international", "displaced"
+            ]
+
+            preferred_actionable_keywords = [
+                "approved", "grade", "enrolled", "evaluations",
+                "credited", "tuition fees", "scholarship", "curricular units"
+            ]
+
+            def is_non_actionable(col):
+                col_l = str(col).lower()
+                return any(k in col_l for k in non_actionable_keywords)
+
+            actionable_features = [
+                col for col in feature_cols
+                if not is_non_actionable(col)
+                and any(k in str(col).lower() for k in preferred_actionable_keywords)
+            ]
+
+            # Fallback if names are different in another dataset.
+            if not actionable_features:
+                actionable_features = [
+                    col for col in feature_cols
+                    if not is_non_actionable(col)
+                ]
+
+            # DiCE needs at least one feature to vary.
+            if not actionable_features:
+                actionable_features = feature_cols
+
+            # Explicit permitted ranges for continuous features.
+            # We slightly expand the min/max to avoid strict boundary errors.
+            permitted_range = {}
+            for col in continuous_features:
+                col_values = pd.to_numeric(dice_dataframe[col], errors="coerce").dropna()
+                if col_values.empty:
+                    continue
+
+                q_val = pd.to_numeric(query_instance[col], errors="coerce").iloc[0]
+                min_v = min(float(col_values.min()), float(q_val))
+                max_v = max(float(col_values.max()), float(q_val))
+
+                if min_v == max_v:
+                    eps = 1e-6
+                else:
+                    eps = max((max_v - min_v) * 0.001, 1e-6)
+
+                permitted_range[col] = [min_v - eps, max_v + eps]
+
+            print("🧩 Continuous features:", continuous_features)
+            print("🧩 Categorical features:", categorical_features)
+            print("🎯 Features to vary:", actionable_features)
+            print("📌 Query instance:")
+            print(query_instance)
+
+            # Create a data object using the cleaned dataframe.
+            data = dml.Data(
+                dataframe=dice_dataframe,
+                continuous_features=continuous_features,
+                categorical_features=categorical_features,
+                outcome_name=target_col
+            )
 
             # Simulación manual de la clase ModelTypes
             class ModelTypes:
                 Classifier = "classifier"
                 Regressor = "regressor"
-
-            # Create a model object using the trained model and specify the backend
 
             from dice_ml.model_interfaces.base_model import BaseModel
 
@@ -432,9 +962,11 @@ class CounterfactualsComponent(ExplainerComponent):
                     self.model_type = ModelTypes.Classifier
 
                 def predict(self, input_data):
+                    input_data = input_data[feature_cols]
                     return self.model.predict(input_data)
 
                 def predict_proba(self, input_data):
+                    input_data = input_data[feature_cols]
                     return self.model.predict_proba(input_data)
 
             class SklearnCompatibleModel:
@@ -443,104 +975,174 @@ class CounterfactualsComponent(ExplainerComponent):
                     self.classes_ = [0, 1]
 
                 def predict(self, X):
+                    X = X[feature_cols]
                     return self.model.predict(X)
 
                 def predict_proba(self, X):
+                    X = X[feature_cols]
                     return self.model.predict_proba(X)
 
-            wrapped_model = SklearnCompatibleModel(self.trained_model)
-
-            # Detect if the model has submodel
+            # Detect if the model has submodel.
             if hasattr(self.trained_model, "model"):
                 print("🔁 Received model is AutoML container, using .model")
                 model_to_use = self.trained_model.model
             else:
-                print(
-                    "✅ The received model is final (RandomForest, etc.), using it directly.")
+                print("✅ The received model is final (RandomForest, etc.), using it directly.")
                 model_to_use = self.trained_model
 
             wrapped_model = SklearnCompatibleModel(model_to_use)
             model = CustomSklearnModel(model=wrapped_model)
 
             print("🚀 wrapped_model.classes_:", wrapped_model.classes_)
-            print("🚀 wrapped_model.predict_proba:", wrapped_model.predict_proba(
-                student_data_deleted_target_column))
+            print("🚀 wrapped_model.predict_proba:", wrapped_model.predict_proba(query_instance))
 
-            # Create a Dice object using the data and model objects
+            # Create a Dice object using the data and model objects.
             exp = dml.Dice(data, model, method="random")
 
-            # Generate counterfactuals for the selected row using the Dice object, and specify the desired number and class of counterfactuals
-            dice_exp = exp.generate_counterfactuals(
-                student_data_deleted_target_column, total_CFs=input, desired_class="opposite")
-            if not dice_exp.cf_examples_list or dice_exp.cf_examples_list[0].final_cfs_df.empty:
+            # -----------------------------
+            # 4) Generate counterfactuals
+            # -----------------------------
+            # Goal of the individual counterfactuals:
+            # minimize the student's dropout probability.
+            # Project encoding: 0 = Dropout, 1 = No dropout.
+            desired_no_dropout_class = 1
+            candidate_total_cfs = max(total_cfs, 10)
+
+            try:
+                print("🎯 Original P(Dropout):", model.predict_proba(query_instance)[0][0])
+                print("🎯 Generating candidate CFs towards No dropout:", candidate_total_cfs)
+
+                try:
+                    dice_exp = exp.generate_counterfactuals(
+                        query_instance,
+                        total_CFs=candidate_total_cfs,
+                        desired_class=desired_no_dropout_class,
+                        features_to_vary=actionable_features,
+                        permitted_range=permitted_range if permitted_range else None
+                    )
+                except Exception as first_error:
+                    # If DiCE cannot generate a larger candidate pool, retry with the requested amount.
+                    if candidate_total_cfs != total_cfs:
+                        print(f"⚠️ Could not generate {candidate_total_cfs} CF candidates. Retrying with {total_cfs}: {first_error}")
+                        dice_exp = exp.generate_counterfactuals(
+                            query_instance,
+                            total_CFs=total_cfs,
+                            desired_class=desired_no_dropout_class,
+                            features_to_vary=actionable_features,
+                            permitted_range=permitted_range if permitted_range else None
+                        )
+                    else:
+                        raise
+            except ValueError as e:
+                print(f"❌ Error generating counterfactuals: {e}")
+                original_display = student_data.copy()
+                original_display[target_col] = original_display[target_col].replace({0: "Dropout", 1: "No dropout"})
+
+                original_data = original_display.to_dict("records")
+                original_columns = [{"name": i, "id": i} for i in original_display.columns]
+
+                return [], [], original_data, original_columns, True, False, [
+                    dbc.Alert(
+                        [
+                            html.Strong("DiCE could not generate counterfactuals for this student. "),
+                            html.Span(str(e)),
+                            html.Br(),
+                            html.Small(
+                                "The input row was normalized and checked, but DiCE still rejected one feature. "
+                                "Try another student or reduce immutable/categorical variables."
+                            )
+                        ],
+                        color="warning"
+                    )
+                ], "", {'display': 'none'}
+            except Exception as e:
+                print(f"❌ Unexpected error generating counterfactuals: {e}")
+                original_display = student_data.copy()
+                original_display[target_col] = original_display[target_col].replace({0: "Dropout", 1: "No dropout"})
+
+                original_data = original_display.to_dict("records")
+                original_columns = [{"name": i, "id": i} for i in original_display.columns]
+
+                return [], [], original_data, original_columns, True, False, [
+                    dbc.Alert(f"Unexpected error generating counterfactuals: {e}", color="danger")
+                ], "", {'display': 'none'}
+
+            if not dice_exp.cf_examples_list or dice_exp.cf_examples_list[0].final_cfs_df is None or dice_exp.cf_examples_list[0].final_cfs_df.empty:
                 print("❌ No counterfactuals generated.")
 
-                # Simulate a fictional counterfactual
-                cf_object_to_csv = student_data_deleted_target_column.copy()
-                # change an arbitrary numerical variable
-                cf_object_to_csv.iloc[0, 0] += 1
-                cf_object_to_csv[self.dataframe.columns[-1]
-                                 ] = 1 - student_data.iloc[0, -1]
+                original_display = student_data.copy()
+                original_display[target_col] = original_display[target_col].replace({0: "Dropout", 1: "No dropout"})
 
-                # Also simulare the original
-                student_data.iloc[:, -1] = student_data.iloc[:, -
-                                                             1].replace({0: "Dropout", 1: "No dropout"})
-                cf_object_to_csv.iloc[:, -1] = cf_object_to_csv.iloc[:, -
-                                                                     1].replace({0: "Dropout", 1: "No dropout"})
+                original_data = original_display.to_dict("records")
+                original_columns = [{"name": i, "id": i} for i in original_display.columns]
 
-                original_data = student_data.to_dict('records')
-                original_columns = [{"name": i, "id": i}
-                                    for i in student_data.columns]
-                counterfactuals_data = cf_object_to_csv.to_dict('records')
-                counterfactuals_columns = [{"name": i, "id": i}
-                                           for i in cf_object_to_csv.columns]
+                return [], [], original_data, original_columns, True, False, [
+                    dbc.Alert(
+                        "DiCE did not find valid counterfactuals for this student with the current constraints.",
+                        color="warning"
+                    )
+                ], "", {'display': 'none'}
 
-                return counterfactuals_data, counterfactuals_columns, original_data, original_columns, False, False
+            cf_object_to_csv = dice_exp.cf_examples_list[0].final_cfs_df.copy()
 
-            cf_object = dice_exp.cf_examples_list[0].final_cfs_df
+            # Some DiCE versions return the target as a column, others do not.
+            if target_col not in cf_object_to_csv.columns:
+                predicted_cf = model.predict(cf_object_to_csv[feature_cols])
+                cf_object_to_csv[target_col] = predicted_cf
 
-            # Convert the counterfactuals dataframe to a CSV string, then read it back into a pandas dataframe
-            cf_object_to_csv = cf_object.to_csv(index=False)
-            cf_object_to_csv = pd.read_csv(StringIO(cf_object_to_csv))
+            # Rank counterfactuals by the lowest predicted dropout probability.
+            # This keeps the most prescriptive scenarios first.
+            try:
+                cf_features = cf_object_to_csv[feature_cols].copy()
+                cf_dropout_probas = model.predict_proba(cf_features)[:, 0]
+                cf_object_to_csv["Predicted P(Dropout)"] = cf_dropout_probas
+                cf_object_to_csv = (
+                    cf_object_to_csv
+                    .sort_values("Predicted P(Dropout)", ascending=True)
+                    .head(total_cfs)
+                    .reset_index(drop=True)
+                )
+                print("✅ Individual CFs sorted by lowest P(Dropout):")
+                print(cf_object_to_csv[["Predicted P(Dropout)"]])
+            except Exception as e:
+                print(f"⚠️ Could not rank individual CFs by P(Dropout): {e}")
 
-            # Replace binary values with labels (Dropout or No dropout)
-            student_data.iloc[:, -1] = student_data.iloc[:, -
-                                                         1].replace({0: "Dropout", 1: "No dropout"})
-            cf_object_to_csv.iloc[:, -1] = cf_object_to_csv.iloc[:, -
-                                                                 1].replace({0: "Dropout", 1: "No dropout"})
+            # Keep only known columns, target and optional risk score, avoiding index/extra columns.
+            final_cols = [c for c in feature_cols if c in cf_object_to_csv.columns] + [target_col]
+            if "Predicted P(Dropout)" in cf_object_to_csv.columns:
+                final_cols.append("Predicted P(Dropout)")
+            cf_object_to_csv = cf_object_to_csv[final_cols]
 
-            # Convert the counterfactuals dataframe and original dataframe to dictionaries of records, and create a list of column definitions
-            original_data = student_data.to_dict('records')
-            original_columns = [{"name": i, "id": i}
-                                for i in student_data.columns]
-            counterfactuals_data = cf_object_to_csv.to_dict('records')
-            counterfactuals_columns = [{"name": i, "id": i}
-                                       for i in cf_object_to_csv.columns]
+            # Replace binary values with labels.
+            student_display = student_data.copy()
+            student_display[target_col] = student_display[target_col].replace({0: "Dropout", 1: "No dropout"})
+            cf_display = cf_object_to_csv.copy()
+            cf_display[target_col] = cf_display[target_col].replace({0: "Dropout", 1: "No dropout"})
 
-            # Return a tuple containing the counterfactuals data, counterfactuals columns, original data, original columns, and False values for the last two elements of the tuple
+            original_data = student_display.to_dict("records")
+            original_columns = [{"name": i, "id": i} for i in student_display.columns]
+            counterfactuals_data = cf_display.to_dict("records")
+            counterfactuals_columns = [{"name": i, "id": i} for i in cf_display.columns]
+
             print("✅ Counterfactuals generated correctly:")
-            print(dice_exp.cf_examples_list[0].final_cfs_df)
+            print(cf_object_to_csv)
 
-            # Comparison graphs
-            # Probabilities of the original
-            original_proba = model.predict_proba(student_data_deleted_target_column)[
-                0][0]  # P(Dropout)
+            # -----------------------------
+            # 5) Graphs and tables
+            # -----------------------------
+            original_proba = model.predict_proba(query_instance)[0][0]  # P(Dropout)
 
-            # Probabilities of the CF
-            cf_probas = [model.predict_proba(pd.DataFrame([row]))[0][0] for _, row in cf_object_to_csv.drop(
-                columns=[self.dataframe.columns[-1]]).iterrows()]
+            cf_probas = [
+                model.predict_proba(pd.DataFrame([row], columns=feature_cols))[0][0]
+                for _, row in cf_object_to_csv[feature_cols].iterrows()
+            ]
 
-            # Graph
-            labels = ["Original"] + \
-                [f"CF {i+1}" for i in range(len(cf_probas))]
+            labels = ["Original"] + [f"CF {i+1}" for i in range(len(cf_probas))]
             values = [original_proba] + cf_probas
-            colors = ["gray"] + ["green" if p <
-                                 original_proba else "red" for p in cf_probas]
 
             fig = go.Figure(go.Bar(
                 x=labels,
                 y=values,
-                marker_color=colors,
                 text=[f"{v:.2%}" for v in values],
                 textposition="outside"
             ))
@@ -553,25 +1155,24 @@ class CounterfactualsComponent(ExplainerComponent):
 
             graph = dcc.Graph(figure=fig)
 
-            # Radar chart: how the features change
-            # Only the ones that have changed
-            # All the numeric
-            numeric_features = student_data_deleted_target_column.select_dtypes(include=[
-                                                                                "number"]).columns
+            numeric_features = query_instance.select_dtypes(include=["number"]).columns
 
-            # We only use the ones with detected changes
             features = [
                 col for col in numeric_features
-                if any(cf[col] != student_data_deleted_target_column[col].iloc[0] for _, cf in cf_object_to_csv.iterrows())
+                if col in cf_object_to_csv.columns
+                and any(cf[col] != query_instance[col].iloc[0] for _, cf in cf_object_to_csv.iterrows())
             ]
 
-            # Warn if there are no changes
             if not features:
                 radar_graph = html.Div([
                     html.Br(),
-                    html.Div("⚠️ There are no modified or valid numeric variables for the radar chart.", style={
-                             "color": "orange", "fontWeight": "bold"})
+                    html.Div(
+                        "⚠️ There are no modified or valid numeric variables for the radar chart.",
+                        style={"color": "orange", "fontWeight": "bold"}
+                    )
                 ])
+                change_table = html.Div("No numeric feature changes to show.")
+                impact_graph = html.Div("No modified variables, the impact cannot be estimated.")
             else:
                 radar_fig = go.Figure()
 
@@ -584,7 +1185,7 @@ class CounterfactualsComponent(ExplainerComponent):
                     ))
 
                 radar_fig.add_trace(go.Scatterpolar(
-                    r=student_data_deleted_target_column[features].iloc[0],
+                    r=query_instance[features].iloc[0],
                     theta=features,
                     fill='toself',
                     name='Original',
@@ -600,31 +1201,30 @@ class CounterfactualsComponent(ExplainerComponent):
 
                 radar_graph = dcc.Graph(figure=radar_fig)
 
-                # Table comparing the changes
-                original_row = student_data_deleted_target_column.iloc[0]
-                cf_rows = cf_object_to_csv.drop(
-                    columns=[self.dataframe.columns[-1]])
+                original_row = query_instance.iloc[0]
+                cf_rows = cf_object_to_csv[feature_cols]
 
                 comparison_df = pd.DataFrame({'Original': original_row})
 
-                # Add columns of each counterfactual
                 for i in range(len(cf_rows)):
                     comparison_df[f'CF {i+1}'] = cf_rows.iloc[i]
 
-                # Filter only features with changes
-                changed_only = comparison_df.loc[(
-                    comparison_df != comparison_df['Original'].values.reshape(-1, 1)).any(axis=1)]
+                changed_only = comparison_df.loc[
+                    (comparison_df != comparison_df['Original'].values.reshape(-1, 1)).any(axis=1)
+                ]
 
-                # ➜ dataframe con columna 'Variable'
                 changed_with_var = changed_only.reset_index().rename(columns={'index': 'Variable'})
 
-                # Table
                 change_table = dash_table.DataTable(
-                    columns=[{'name': c, 'id': c} for c in changed_with_var.columns],   # ← usa columnas correctas
-                    data=changed_with_var.to_dict('records'),                            # ← y los datos correctos
+                    columns=[{'name': c, 'id': c} for c in changed_with_var.columns],
+                    data=changed_with_var.to_dict('records'),
                     style_data_conditional=[
-                        {'if': {'column_id': col, 'filter_query': f'{{{col}}} != {{Original}}'},
-                        'backgroundColor': '#d2f8d2'} for col in changed_with_var.columns if col not in ['Original','Variable']
+                        {
+                            'if': {'column_id': col, 'filter_query': f'{{{col}}} != {{Original}}'},
+                            'backgroundColor': '#d2f8d2'
+                        }
+                        for col in changed_with_var.columns
+                        if col not in ['Original', 'Variable']
                     ] + [
                         {'if': {'column_id': 'Original'}, 'backgroundColor': '#f0f0f0', 'fontWeight': 'bold'},
                         {'if': {'column_id': 'Variable'}, 'textAlign': 'left', 'fontWeight': '600'}
@@ -633,46 +1233,39 @@ class CounterfactualsComponent(ExplainerComponent):
                     style_cell={'textAlign': 'center'},
                 )
 
-                # Impact graph
-                original_row = student_data_deleted_target_column.iloc[0]
-                target_col = self.dataframe.columns[-1]
-
                 variable_impact = {}
 
                 for _, cf_row in cf_object_to_csv.iterrows():
-                    cf_row_clean = cf_row.drop(target_col)
+                    cf_row_clean = cf_row[feature_cols]
 
                     changed_vars = [
-                        col for col in cf_row_clean.index if cf_row_clean[col] != original_row[col]]
+                        col for col in feature_cols
+                        if cf_row_clean[col] != original_row[col]
+                    ]
 
                     if not changed_vars:
                         continue
 
-                    prob_orig = model.predict_proba(
-                        pd.DataFrame([original_row]))[0][0]
-                    prob_cf = model.predict_proba(
-                        pd.DataFrame([cf_row_clean]))[0][0]
+                    prob_orig = model.predict_proba(pd.DataFrame([original_row], columns=feature_cols))[0][0]
+                    prob_cf = model.predict_proba(pd.DataFrame([cf_row_clean], columns=feature_cols))[0][0]
                     delta_prob = prob_cf - prob_orig
 
                     impact_per_var = delta_prob / len(changed_vars)
 
                     for var in changed_vars:
-                        variable_impact[var] = variable_impact.get(
-                            var, 0) + impact_per_var
+                        variable_impact[var] = variable_impact.get(var, 0) + impact_per_var
 
-                # If there are data
                 if variable_impact:
-                    # Convert to DataFrame and calculate the average (if you want the average by number of CFs)
-                    impact_df = pd.DataFrame(list(variable_impact.items()), columns=[
-                                             "Variable", "Cumulative impact"])
-                    impact_df.sort_values(
-                        "Cumulative impact", ascending=True, inplace=True)
+                    impact_df = pd.DataFrame(
+                        list(variable_impact.items()),
+                        columns=["Variable", "Cumulative impact"]
+                    )
+                    impact_df.sort_values("Cumulative impact", ascending=True, inplace=True)
 
                     impact_fig = go.Figure(go.Bar(
                         x=impact_df["Cumulative impact"],
                         y=impact_df["Variable"],
-                        orientation='h',
-                        marker_color='seagreen'
+                        orientation='h'
                     ))
 
                     impact_fig.update_layout(
@@ -687,9 +1280,58 @@ class CounterfactualsComponent(ExplainerComponent):
                     impact_graph = dcc.Graph(figure=impact_fig)
                 else:
                     impact_graph = html.Div(
-                        "⚠️ There are no modified variables, the impact cannot be estimated.")
+                        "⚠️ There are no modified variables, the impact cannot be estimated."
+                    )
 
-            return counterfactuals_data, counterfactuals_columns, original_data, original_columns, False, False, [graph, radar_graph, html.Br(), html.H5("Changes in features"), change_table, html.Br(), html.H5("Predicted impact of each modified feature"), impact_graph]
+            recommendation_component = ""
+            recommendation_style = {'display': 'none'}
+
+            try:
+                original_row = student_data.iloc[0]
+                cf_display_df = cf_display.copy()
+                counterfactuals_text = build_counterfactuals_text(original_row, cf_display_df)
+                group_description = build_student_summary(original_row, target_col)
+
+                recommendation_text = generate_rag_recommendations(
+                    group_description=group_description,
+                    counterfactuals_text=counterfactuals_text,
+                    model_key=rag_model_key
+                )
+
+                recommendation_component = build_rag_card(
+                    recommendation_text=recommendation_text,
+                    model_key=rag_model_key,
+                    title="Individual RAG recommendation"
+                )
+                recommendation_style = {'display': 'block'}
+
+            except Exception as e:
+                recommendation_component = build_rag_error_card(
+                    error_message=e,
+                    title="Individual RAG recommendation"
+                )
+                recommendation_style = {'display': 'block'}
+
+            return (
+                counterfactuals_data,
+                counterfactuals_columns,
+                original_data,
+                original_columns,
+                False,
+                False,
+                [
+                    graph,
+                    radar_graph,
+                    html.Br(),
+                    html.H5("Changes in features"),
+                    change_table,
+                    html.Br(),
+                    html.H5("Predicted impact of each modified feature"),
+                    impact_graph
+                ],
+                recommendation_component,
+                recommendation_style
+            )
 
 
 class TimerComponent(ExplainerComponent):
