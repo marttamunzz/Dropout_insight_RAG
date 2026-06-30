@@ -40,6 +40,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SAVED_MODELS_ROOT = Path(BASE_DIR) / "saved_models"
 css_path = [
     os.path.join(BASE_DIR, "assets", "fonts.css"),
     os.path.join(BASE_DIR, "assets", "custom.css"),
@@ -51,30 +52,90 @@ for p in css_path:
 
 #NUEVO CONTENIDO PARA GUARDAR LOS SHAP A VER SI NO TENGO QUE CARGARLOS CADA VEZ QUE SE EJECUTE LA APP
 
-# --- Calcula SHAP una vez dentro del explainer y re-guarda el .dill (atómico) ---
+# --- Guardado seguro de explainers y cache separado de SHAP ---
+def temporarily_remove_unserializable_shap_objects(explainer):
+    """
+    Quita temporalmente objetos internos de SHAP antes de guardar con dill.
+    Importante: no los deja en None. Los elimina y devuelve una copia para
+    restaurarlos en memoria después del dump. Así la interfaz puede seguir
+    usando el explainer durante esta ejecución.
+    """
+    backup = {}
+    for attr in (
+        "_shap_explainer",
+        "_shap_interaction_explainer",
+    ):
+        if hasattr(explainer, attr):
+            try:
+                backup[attr] = getattr(explainer, attr)
+                delattr(explainer, attr)
+                print(f"🧹 Eliminado temporalmente {attr} antes de guardar el explainer")
+            except Exception as e:
+                print(f"⚠️ No se pudo eliminar temporalmente {attr}: {e}")
+    return backup
+
+
+def restore_temporarily_removed_objects(explainer, backup):
+    """Restaura en memoria los objetos que se quitaron antes del dump."""
+    for attr, value in backup.items():
+        try:
+            setattr(explainer, attr, value)
+        except Exception as e:
+            print(f"⚠️ No se pudo restaurar {attr}: {e}")
+
+
+def allow_shap_recreation_if_needed(explainer):
+    """
+    Si un explainer antiguo se guardó con _shap_explainer=None, lo eliminamos.
+    Así la property shap_explainer podrá reconstruirlo si alguna vista lo necesita.
+    """
+    for attr in ("_shap_explainer", "_shap_interaction_explainer"):
+        if hasattr(explainer, attr) and getattr(explainer, attr) is None:
+            try:
+                delattr(explainer, attr)
+                print(f"🛠️ Eliminado {attr}=None para permitir recreación si hace falta")
+            except Exception as e:
+                print(f"⚠️ No se pudo eliminar {attr}=None: {e}")
+
+def save_clean_explainer_atomic(explainer, dill_path):
+    """
+    Guarda el ClassifierExplainer sin serializar el objeto SHAP interno.
+    Los valores SHAP se guardan aparte en shap_cache/*.npz.
+
+    Se eliminan los objetos SHAP solo durante el dump y se restauran
+    después para no romper la interfaz en la ejecución actual.
+    """
+    dill_path = Path(dill_path)
+    dill_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dill_path.with_name(dill_path.name + ".tmp.dill")
+
+    backup = temporarily_remove_unserializable_shap_objects(explainer)
+
+    try:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        explainer.dump(str(tmp_path))
+        os.replace(str(tmp_path), str(dill_path))
+        print(f"💾 Explainer limpio guardado en: {dill_path}")
+    except Exception:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        raise
+    finally:
+        restore_temporarily_removed_objects(explainer, backup)
+
+
 def ensure_shap_inside_explainer(explainer, dill_path: str):
     """
-    Si el explainer no tiene SHAP cacheados internamente, los calcula UNA VEZ
-    y re-guarda el .dill de forma atómica. Si ya están, no hace nada.
+    Función mantenida por compatibilidad. Ya no re-guarda SHAP dentro del .dill,
+    porque eso puede serializar KernelExplainer y romper el guardado.
+    Usa inject_cached_shap_into_explainer(...) en su lugar.
     """
-    # ¿ya existen en memoria?
-    if getattr(explainer, "_shap_values", None) is not None or hasattr(explainer, "_shap_values_df"):
-        print("✅ SHAP ya viven dentro del explainer (no se recalcula).")
-        return
-
-    print("🟡 SHAP no están dentro. Calculando una vez desde el explainer...")
-    if hasattr(explainer, "get_shap_values_df"):
-        _ = explainer.get_shap_values_df()
-    elif hasattr(explainer, "get_shap_values"):
-        _ = explainer.get_shap_values()
-    else:
-        _ = explainer.shap_values
-
-    # ⬇️ usa un temporal con extensión .dill para forzar dill
-    tmp = dill_path + ".tmp.dill"
-    explainer.dump(tmp)          
-    os.replace(tmp, dill_path)  
-    print(f"💾 Explainer re-guardado con SHAP dentro: {dill_path}")
+    print("ℹ️ SHAP ya no se guarda dentro del .dill; se usa shap_cache/*.npz.")
+    return None
 
 def csv_sha256_from_contents(contents: str) -> str:
     _, b64 = contents.split(',', 1)
@@ -83,9 +144,11 @@ def csv_sha256_from_contents(contents: str) -> str:
 def atomic_save_npz(path: Path, **arrays):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(delete=False, dir=path.parent, suffix=".tmp") as tmp:
-        np.savez_compressed(tmp.name, **arrays)
-        tmp.flush(); os.fsync(tmp.fileno())
+    with tempfile.NamedTemporaryFile(delete=False, dir=path.parent, suffix=".npz") as tmp:
+        # Importante: pasar el file object, no tmp.name, para que numpy no cree otro .npz aparte.
+        np.savez_compressed(tmp, **arrays)
+        tmp.flush()
+        os.fsync(tmp.fileno())
         tmpname = tmp.name
     os.replace(tmpname, path)
 
@@ -128,11 +191,22 @@ def inject_cached_shap_into_explainer(explainer, csv_hash: str, shap_cache_dir: 
     Si no hay caché, calcula una única vez con salida 1D (proba[:, proba_idx]) y guarda float32.
     NO reescribe el .dill.
     """
-    # --- Normaliza X ---
+    # --- Normaliza X sin ordenar, para no desalinear X e y ---
+    explainer.X = explainer.X.copy()
     explainer.X.index = explainer.X.index.map(str)
-    explainer.X.sort_index(inplace=True)
+    if hasattr(explainer, "y") and hasattr(explainer.y, "index"):
+        try:
+            explainer.y = explainer.y.copy()
+            explainer.y.index = explainer.X.index
+        except Exception:
+            pass
 
-    model_fp = file_sha256(explainer_dill_path)[:16]   # huella estable del explainer guardado
+    explainer_dill_path = Path(explainer_dill_path)
+    if explainer_dill_path.exists():
+        model_fp = file_sha256(explainer_dill_path)[:16]   # huella estable del explainer limpio guardado
+    else:
+        model_fp = build_model_fingerprint(explainer.model)
+
     key = hashlib.sha256(
         f"{csv_hash}|{model_fp}|{tuple(explainer.X.columns)}|{explainer.X.shape}".encode()
     ).hexdigest()[:24]
@@ -142,51 +216,107 @@ def inject_cached_shap_into_explainer(explainer, csv_hash: str, shap_cache_dir: 
     shap_meta = shap_cache_dir / f"shap_{key}.json"
 
     def _assign(values, base_values, data, feature_names):
-        explainer._shap_values = values
-        try:
-            explainer._shap_base_value = base_values
-        except Exception:
-            pass
-        # Alinear X con los datos guardados si están
+        """
+        Inyecta los SHAP en el formato que espera explainerdashboard.
+        El bug anterior era que solo metíamos explainer._shap_values, pero
+        explainerdashboard realmente consulta _shap_values_df o usa
+        set_shap_values(). Si _shap_values_df no existe, intenta llamar a
+        self.shap_explainer.shap_values(), y como lo habíamos limpiado daba
+        NoneType.
+        """
+        allow_shap_recreation_if_needed(explainer)
+
+        values = np.asarray(values)
+        if values.ndim == 3 and values.shape[-1] == 1:
+            values = values[:, :, 0]
+        if values.ndim != 2:
+            raise RuntimeError(f"SHAP values should be 2D, got shape={values.shape}")
+        values = values.astype(np.float32, copy=False)
+
+        # Mantener X alineada, pero sin cambiarla si no hace falta.
         if data is not None and data.shape[0] == explainer.X.shape[0]:
-            explainer.X = pd.DataFrame(data, columns=feature_names, index=explainer.X.index)
-        # Reset caches de dataframes si existen
-        if hasattr(explainer, "_shap_values_df"):
-            explainer._shap_values_df = None
-        if hasattr(explainer, "_shap_interaction_values_df"):
-            explainer._shap_interaction_values_df = None
+            try:
+                explainer.X = pd.DataFrame(data, columns=feature_names, index=explainer.X.index)
+            except Exception:
+                pass
+
+        # Limpiar caches derivadas antiguas.
+        for cache_attr in (
+            "_mean_abs_shap_df",
+            "_shap_interaction_values",
+            "_shap_interaction_values_df",
+        ):
+            if hasattr(explainer, cache_attr):
+                try:
+                    delattr(explainer, cache_attr)
+                except Exception:
+                    pass
+
+        # Base value de la clase positiva. SHAP puede devolver escalar o vector por fila.
+        if base_values is None or np.asarray(base_values).size == 0:
+            base_pos = 0.5
+        else:
+            base_arr = np.asarray(base_values, dtype=np.float32)
+            base_pos = float(np.mean(base_arr))
+
+        # Para clasificación binaria y salida en probabilidad:
+        # clase 1 = base_pos + SHAP
+        # clase 0 = 1 - clase 1 => base 1-base_pos y SHAP negativos.
+        try:
+            if len(getattr(explainer, "labels", [])) == 2 and hasattr(explainer, "set_shap_values"):
+                explainer.set_shap_values(
+                    [float(1.0 - base_pos), float(base_pos)],
+                    [-values, values],
+                )
+                print("✅ SHAP inyectados con explainer.set_shap_values()")
+            else:
+                explainer._shap_base_value = base_pos
+                explainer._shap_values_df = pd.DataFrame(values, columns=explainer.columns).astype(explainer.precision)
+                print("✅ SHAP inyectados manualmente en _shap_values_df")
+        except Exception as e:
+            # Fallback directo para que columns_ranked_by_shap() no llame a shap_explainer.
+            print(f"⚠️ set_shap_values falló, usando fallback _shap_values_df: {e}")
+            explainer._shap_base_value = [float(1.0 - base_pos), float(base_pos)]
+            explainer._shap_values_df = pd.DataFrame(values, columns=explainer.columns).astype(explainer.precision)
+
+        # Guardamos también el array por compatibilidad con código propio.
+        explainer._shap_values = values
 
     # --- Intentar leer caché existente ---
     def _try_load_cache() -> bool:
         if not (shap_npz.exists() and shap_meta.exists()):
             return False
         try:
-            npz = np.load(shap_npz, allow_pickle=False)
+            with np.load(shap_npz, allow_pickle=False) as npz:
+                values = npz["values"]
+                # Si aún así es object, purgamos
+                if values.dtype == object:
+                    print("⚠️ SHAP cache dtype=object. Rebuilding...")
+                    try:
+                        shap_npz.unlink()
+                    except Exception:
+                        pass
+                    try:
+                        shap_meta.unlink()
+                    except Exception:
+                        pass
+                    return False
+
+                base_values = npz["base_values"] if "base_values" in npz and npz["base_values"].size else None
+                data = npz["data"] if "data" in npz else None
         except ValueError:
             # Caché antigua con objetos -> purgar
             print("⚠️ SHAP cache contains pickled/object arrays. Rebuilding...")
             try:
                 shap_npz.unlink()
-            except: pass
+            except Exception:
+                pass
             try:
                 shap_meta.unlink()
-            except: pass
+            except Exception:
+                pass
             return False
 
-        values = npz["values"]
-        # Si aún así es object, purgamos
-        if values.dtype == object:
-            print("⚠️ SHAP cache dtype=object. Rebuilding...")
-            try:
-                shap_npz.unlink()
-            except: pass
-            try:
-                shap_meta.unlink()
-            except: pass
-            return False
-
-        base_values = npz["base_values"] if "base_values" in npz and npz["base_values"].size else None
-        data = npz["data"] if "data" in npz else None
         meta = json.loads(shap_meta.read_text(encoding="utf-8"))
         feature_names = meta.get("feature_names", list(explainer.X.columns))
         _assign(values, base_values, data, feature_names)
@@ -198,15 +328,22 @@ def inject_cached_shap_into_explainer(explainer, csv_hash: str, shap_cache_dir: 
 
     # --- No hay caché válida: calcular y guardar en formato numérico 1D ---
     import shap
-    # Forzamos salida 1D para evitar multi-salida (que a veces genera dtype=object)
+    feature_names = list(explainer.X.columns)
+
+    def _as_dataframe(A):
+        if isinstance(A, pd.DataFrame):
+            return A[feature_names]
+        return pd.DataFrame(A, columns=feature_names)
+
+    # Forzamos salida 1D para evitar multi-salida y dtype=object.
     if hasattr(explainer.model, "predict_proba"):
         def pred_fn(A):
-            P = explainer.model.predict_proba(A)
-            # seguridad por si hay solo 1 columna
-            idx = proba_idx if P.shape[1] > proba_idx else (P.shape[1]-1)
+            P = explainer.model.predict_proba(_as_dataframe(A))
+            idx = proba_idx if P.shape[1] > proba_idx else (P.shape[1] - 1)
             return P[:, idx]
     else:
-        pred_fn = explainer.model.predict
+        def pred_fn(A):
+            return explainer.model.predict(_as_dataframe(A))
 
     # Background pequeño y determinista
     bg = explainer.X.sample(n=min(100, len(explainer.X)), random_state=42)
@@ -516,15 +653,15 @@ def create_AutoML_model(contents, filename):
     print("📌 X_test index before explainer:", X_test.index[:5])
     print("📌 Type of index:", type(X_test.index))
 
-    dataset_name = filename.split(".")[0]
-    model_path = os.path.join("saved_models", dataset_name, "AutoML")
-    report_path = os.path.join("saved_models", dataset_name, "reportML.pkl")
+    dataset_name = Path(filename).stem
+    model_path = SAVED_MODELS_ROOT / dataset_name / "AutoML"
+    report_path = SAVED_MODELS_ROOT / dataset_name / "reportML.pkl"
 
-    if os.path.exists(model_path):
-        model = AutoML(model_path)
+    if model_path.exists():
+        model = AutoML(str(model_path))
 
         # Loading reportML.pkl if exists
-        if os.path.exists(report_path):
+        if report_path.exists():
             with open(report_path, "rb") as f:
                 reportML = pickle.load(f)
         else:
@@ -535,9 +672,9 @@ def create_AutoML_model(contents, filename):
 
         return model, X_test, y_test, reportML, model, df, True
 
-    os.makedirs(model_path, exist_ok=True)
+    model_path.mkdir(parents=True, exist_ok=True)
     model = AutoML(
-        results_path=model_path,
+        results_path=str(model_path),
         algorithms=["Baseline", "Linear", "Decision Tree", "Random Forest", "Extra Trees",
                     "Xgboost", "LightGBM", "CatBoost", "Neural Network", "Nearest Neighbors"],
         start_random_models=1,
@@ -649,25 +786,26 @@ def create_dashboard(n_clicks, contents, filename):
         ), True
 
     # OK
-    dataset_name = filename.split(".")[0]
-    saved_dir = os.path.join("saved_models", dataset_name)
-    saved_explainer_path = os.path.join(saved_dir, "explainer.dill")
-    report_path = os.path.join(saved_dir, "reportML.pkl")
-    os.makedirs(saved_dir, exist_ok=True)
+    dataset_name = Path(filename).stem
+    saved_dir = SAVED_MODELS_ROOT / dataset_name
+    saved_explainer_path = saved_dir / "explainer.dill"
+    report_path = saved_dir / "reportML.pkl"
+    saved_dir.mkdir(parents=True, exist_ok=True)
     print(f"Folder created or existing: {saved_dir}")
+    print(f"📍 Explainer path absoluto: {saved_explainer_path.resolve()}")
 
     #OTRA COSA PARA PROBAR QUE OCURRE SI GUARDO LOS SHAP Y SI NO SE TIENEN Q CALCULAR SIEMPRE (SOLO UNA LINEA)
-    shap_cache_dir = Path(saved_dir) / "shap_cache"
+    shap_cache_dir = saved_dir / "shap_cache"
 
 
     explainer = None
     trained = None
     reportML = None
 
-    if os.path.exists(saved_explainer_path):
+    if saved_explainer_path.exists():
         try:
             print("🔁 Loading explainer from:", saved_explainer_path)
-            explainer = ClassifierExplainer.from_file(saved_explainer_path)
+            explainer = ClassifierExplainer.from_file(str(saved_explainer_path))
 
             # ¡justo aquí!
             disable_permutation(explainer)
@@ -689,7 +827,7 @@ def create_dashboard(n_clicks, contents, filename):
             if idx_actual != idx_backup:
                 return dbc.Alert("The explainer is corrupt. Upload the dataset again to regenerate it.", color="danger"), True
             
-            ensure_shap_inside_explainer(explainer, saved_explainer_path)
+            inject_cached_shap_into_explainer(explainer, csv_hash, shap_cache_dir, saved_explainer_path)
 
 
             #MAS COSAS AÑADIDAS PARA NO TENER QUE RECALCULAR LOS SHAP SIEMPREEEEEE 
@@ -702,20 +840,27 @@ def create_dashboard(n_clicks, contents, filename):
             trained = explainer.model
 
             # Cargar reportML si existe
-            if os.path.exists(report_path):
+            if report_path.exists():
                 with open(report_path, "rb") as f:
                     reportML = pickle.load(f)
             else:
                 print("reportML.pkl not founded")
                 reportML = None
 
-            model_path = os.path.join("saved_models", dataset_name, "AutoML")
-            model = AutoML(model_path) if os.path.exists(model_path) else None
+            model_path = SAVED_MODELS_ROOT / dataset_name / "AutoML"
+            model = AutoML(str(model_path)) if model_path.exists() else None
 
         except Exception as e:
-            return dbc.Alert(f"Error loading the explainer: {e}", color="danger"), True
+            print(f"⚠️ Error loading existing explainer: {e}")
+            try:
+                corrupt_path = saved_explainer_path.with_suffix(saved_explainer_path.suffix + ".corrupt")
+                os.replace(str(saved_explainer_path), str(corrupt_path))
+                print(f"🧯 Explainer corrupto movido a: {corrupt_path}")
+            except Exception as move_error:
+                print(f"⚠️ No se pudo mover el explainer corrupto: {move_error}")
+            explainer = None
 
-    else:
+    if explainer is None:
         # No hay explainer: entrenar/cargar AutoML según exista carpeta previa
         model, X_test, y_test, reportML, trained, df, loaded = create_AutoML_model(contents, filename)
         try:
@@ -742,13 +887,19 @@ def create_dashboard(n_clicks, contents, filename):
             explainer.index_backup = X_test_fixed.index.tolist()
 
             # Guardar X_test/y_test y explainer
-            with open(os.path.join(saved_dir, "X_test.pkl"), "wb") as f:
+            with open(saved_dir / "X_test.pkl", "wb") as f:
                 pickle.dump(X_test_fixed, f)
-            with open(os.path.join(saved_dir, "y_test.pkl"), "wb") as f:
+            with open(saved_dir / "y_test.pkl", "wb") as f:
                 pickle.dump(y_test_fixed, f)
 
-            ensure_shap_inside_explainer(explainer, saved_explainer_path)
-            print("Correctly saved the explainer with index:", explainer.X.index[:5])
+            # Primero guardamos el explainer limpio, sin KernelExplainer dentro.
+            save_clean_explainer_atomic(explainer, saved_explainer_path)
+
+            # Después calculamos/cargamos SHAP desde una caché separada .npz.
+            # No se reescribe el .dill después de esto.
+            inject_cached_shap_into_explainer(explainer, csv_hash, shap_cache_dir, saved_explainer_path)
+
+            print("Correctly saved the clean explainer with index:", explainer.X.index[:5])
 
         except Exception as e:
             return dbc.Alert(f"Error generating the explainer: {e}", color="danger"), True
