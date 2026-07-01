@@ -13,7 +13,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import re
  
-from rag.rag_recommender import generate_rag_recommendations
+from rag.rag_recommender import CONTEXT_MODES, generate_rag_recommendations
 from rag.llm_providers import LLM_MODELS
 from tabs.components.components import build_counterfactuals_text, build_student_summary
  
@@ -144,12 +144,13 @@ def split_group_rag_markdown_sections(markdown_text):
     return sections
 
 
-def build_group_rag_card(recommendation_text, model_key=None, title="Group RAG recommendation"):
+def build_group_rag_card(recommendation_text, model_key=None, context_mode_key=None, title="Group RAG recommendation"):
     """
     Build a visual group RAG recommendation card.
     Each main point is displayed as a collapsed accordion item.
     """
     model_label = LLM_MODELS.get(model_key, {}).get("label", model_key or "LLM")
+    context_mode_label = CONTEXT_MODES.get(context_mode_key, {}).get("label", context_mode_key or "Context mode")
     sections = split_group_rag_markdown_sections(recommendation_text)
 
     accordion_items = []
@@ -215,18 +216,44 @@ def build_group_rag_card(recommendation_text, model_key=None, title="Group RAG r
                                 ),
                             ]
                         ),
-                        html.Span(
-                            model_label,
+                        html.Div(
+                            [
+                                html.Span(
+                                    model_label,
+                                    style={
+                                        "display": "inline-flex",
+                                        "alignItems": "center",
+                                        "padding": "7px 12px",
+                                        "borderRadius": "999px",
+                                        "background": "#0f172a",
+                                        "color": "#ffffff",
+                                        "fontSize": "0.82rem",
+                                        "fontWeight": "700",
+                                        "whiteSpace": "nowrap",
+                                    },
+                                ),
+                                html.Span(
+                                    context_mode_label,
+                                    style={
+                                        "display": "inline-flex",
+                                        "alignItems": "center",
+                                        "padding": "7px 12px",
+                                        "borderRadius": "999px",
+                                        "background": "#eef2ff",
+                                        "color": "#3730a3",
+                                        "border": "1px solid rgba(79, 70, 229, 0.25)",
+                                        "fontSize": "0.82rem",
+                                        "fontWeight": "700",
+                                        "whiteSpace": "nowrap",
+                                    },
+                                ),
+                            ],
                             style={
-                                "display": "inline-flex",
+                                "display": "flex",
                                 "alignItems": "center",
-                                "padding": "7px 12px",
-                                "borderRadius": "999px",
-                                "background": "#0f172a",
-                                "color": "#ffffff",
-                                "fontSize": "0.82rem",
-                                "fontWeight": "700",
-                                "whiteSpace": "nowrap",
+                                "justifyContent": "flex-end",
+                                "gap": "8px",
+                                "flexWrap": "wrap",
                             },
                         ),
                     ],
@@ -426,6 +453,21 @@ class GroupCounterfactualsTab(ExplainerComponent):
                                 clearable=False
                             )
                         ], width=6, md=6),
+
+                        dbc.Col([
+                            dbc.Label("Recommendation context"),
+                            dcc.Dropdown(
+                                id='group-rag-context-mode-dropdown',
+                                options=[
+                                    {'label': cfg['label'], 'value': key}
+                                    for key, cfg in CONTEXT_MODES.items()
+                                ],
+                                value='literature_counterfactuals'
+                                if 'literature_counterfactuals' in CONTEXT_MODES
+                                else list(CONTEXT_MODES.keys())[0],
+                                clearable=False
+                            )
+                        ], width=6, md=6),
                     ], class_name="mb-3"),
  
                     #html.Div(id='group-cf-output')
@@ -584,9 +626,10 @@ class GroupCounterfactualsTab(ExplainerComponent):
             State('selected-cluster', 'value'),
             State('clustered-data-store', 'data'),
             State('group-rag-llm-dropdown', 'value'),
+            State('group-rag-context-mode-dropdown', 'value'),
             prevent_initial_call=True
         )
-        def generate_group_counterfactuals(n_clicks, selected_cluster,clustered_json, rag_model_key):
+        def generate_group_counterfactuals(n_clicks, selected_cluster, clustered_json, rag_model_key, rag_context_mode):
             # 0) Guardas iniciales de interacción
             if not n_clicks:
                 raise PreventUpdate
@@ -1053,12 +1096,14 @@ class GroupCounterfactualsTab(ExplainerComponent):
                 rag_recommendation = generate_rag_recommendations(
                     group_description=group_description,
                     counterfactuals_text=counterfactuals_text,
-                    model_key=rag_model_key
+                    model_key=rag_model_key,
+                    context_mode=rag_context_mode
                 )
                 results.append(
                     build_group_rag_card(
                         recommendation_text=rag_recommendation,
                         model_key=rag_model_key,
+                        context_mode_key=rag_context_mode,
                         title="Group RAG recommendation"
                     )
                 )
