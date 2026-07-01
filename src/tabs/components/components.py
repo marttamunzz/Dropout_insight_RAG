@@ -12,7 +12,7 @@ from dash.dependencies import Input, Output, State
 from dash.exceptions import PreventUpdate
 from explainerdashboard.custom import *
 
-from rag.rag_recommender import generate_rag_recommendations
+from rag.rag_recommender import CONTEXT_MODES, generate_rag_recommendations
 from rag.llm_providers import LLM_MODELS
 
 from dice_ml.model_interfaces.base_model import BaseModel
@@ -162,12 +162,13 @@ def split_rag_markdown_sections(markdown_text):
     return sections
 
 
-def build_rag_card(recommendation_text, model_key=None, title="Individual RAG recommendation"):
+def build_rag_card(recommendation_text, model_key=None, context_mode=None, title="Individual RAG recommendation"):
     """
     Build a nicer RAG recommendation card.
     Each Markdown heading returned by the LLM is shown as a collapsible accordion item.
     """
     model_label = LLM_MODELS.get(model_key, {}).get("label", model_key or "LLM")
+    context_label = CONTEXT_MODES.get(context_mode, {}).get("label", context_mode or "Selected context")
     sections = split_rag_markdown_sections(recommendation_text)
 
     accordion_items = []
@@ -262,7 +263,7 @@ def build_rag_card(recommendation_text, model_key=None, title="Individual RAG re
                                     },
                                 ),
                                 html.Div(
-                                    "Evidence retrieved from the RAG system and adapted to the generated counterfactuals.",
+                                    f"Recommendation generated using: {context_label}.",
                                     style={
                                         "fontSize": "0.9rem",
                                         "color": "#64748b",
@@ -739,7 +740,16 @@ class CounterfactualsComponent(ExplainerComponent):
                             value=list(LLM_MODELS.keys())[0],
                             clearable=False
                         ),
-                    ], width=6, md=6)
+                    ], width=6, md=6),
+                    dbc.Col([
+                        dbc.Label("Recommendation context"),
+                        dcc.Dropdown(
+                            id='rag-context-mode-dropdown-'+self.name,
+                            options=[{'label': cfg['label'], 'value': key} for key, cfg in CONTEXT_MODES.items()],
+                            value="literature_counterfactuals",
+                            clearable=False
+                        ),
+                    ], width=6, md=6),
                 ], class_name="mb-3"),
 
                 dbc.Row([
@@ -770,10 +780,11 @@ class CounterfactualsComponent(ExplainerComponent):
             Output('rag-output-'+self.name, 'style'),
             [State('random-index-clas-index-'+self.name, 'value'),
              State('input', 'value'),
-             State('rag-llm-dropdown-'+self.name, 'value')],
+             State('rag-llm-dropdown-'+self.name, 'value'),
+             State('rag-context-mode-dropdown-'+self.name, 'value')],
             [Input('button', 'n_clicks')]
         )
-        def generate_counterfactuals(dataIndex, input, rag_model_key, n_clicks):
+        def generate_counterfactuals(dataIndex, input, rag_model_key, rag_context_mode, n_clicks):
             """
             Generate counterfactual scenarios given a row index and a desired number of counterfactuals.
             This version prepares DiCE inputs using one single, normalized dataframe so the query instance
@@ -1295,12 +1306,14 @@ class CounterfactualsComponent(ExplainerComponent):
                 recommendation_text = generate_rag_recommendations(
                     group_description=group_description,
                     counterfactuals_text=counterfactuals_text,
-                    model_key=rag_model_key
+                    model_key=rag_model_key,
+                    context_mode=rag_context_mode
                 )
 
                 recommendation_component = build_rag_card(
                     recommendation_text=recommendation_text,
                     model_key=rag_model_key,
+                    context_mode=rag_context_mode,
                     title="Individual RAG recommendation"
                 )
                 recommendation_style = {'display': 'block'}

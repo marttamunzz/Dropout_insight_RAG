@@ -410,15 +410,42 @@ no_file_alert = dbc.Alert(
 
 app.layout = dbc.Container([
     html.Div([
-        dbc.Navbar([
-            html.A(
-                dbc.Row([
-                    dbc.Col(dbc.NavbarBrand(
-                        "Dropout Insight: Educational Risk Dashboard with Counterfactual Explanations", className="ms-2"
-                    )),
-                ], className="g-0 ml-auto flex-nowrap mt-3 mt-md-0", align="center"),
-            ),
-        ]),
+
+        html.Div(
+            [
+                html.Div(
+                    "Dropout Insight",
+                    style={
+                        "margin": "0",
+                        "color": "#ffffff",
+                        "fontSize": "34px",
+                        "fontWeight": "900",
+                        "lineHeight": "1.05",
+                        "letterSpacing": "-0.04em",
+                    }
+                ),
+                html.Div(
+                    "Educational Risk Dashboard with Counterfactual Explanations",
+                    style={
+                        "marginTop": "px",
+                        "color": "rgba(255, 255, 255, 0.94)",
+                        "fontSize": "18px",
+                        "fontWeight": "550",
+                        "lineHeight": "1.3",
+                    }
+                ),
+            ],
+            style={
+                "width": "100%",
+                "margin": "22px 0 24px 0",
+                "padding": "22px 28px",
+                "borderRadius": "16px",
+                "background": "linear-gradient(135deg, #2563eb 0%, #4f46e5 100%)",
+                "boxShadow": "0 12px 28px rgba(37, 99, 235, 0.26)",
+                "border": "1px solid rgba(255, 255, 255, 0.22)",
+                "boxSizing": "border-box",
+            }
+        ),
 
         html.Div(
     id="upload-div",
